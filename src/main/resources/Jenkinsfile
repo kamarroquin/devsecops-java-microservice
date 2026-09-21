@@ -1,0 +1,225 @@
+pipeline {
+
+    agent any
+
+    environment {
+
+        APP_NAME = 'devsecops-java-microservice'
+
+        // Jenkins se comunica con SonarQube
+        // por medio de la red interna de Docker.
+        SONAR_HOST_URL = 'http://sonarqube:9000'
+
+        // IMPORTANTE:
+        // Cambiar "TU_USUARIO" por tu usuario real de Docker Hub.
+        DOCKER_IMAGE = 'TU_USUARIO/devsecops-java-microservice'
+    }
+
+    stages {
+
+        stage('Build') {
+
+            steps {
+
+                echo '======================================'
+                echo ' BUILD'
+                echo '======================================'
+
+                // Permiso requerido porque Jenkins corre sobre Linux.
+                sh 'chmod +x mvnw'
+
+                // Compilación del proyecto.
+                sh './mvnw clean compile'
+            }
+        }
+
+
+        stage('Testing - JUnit + JaCoCo') {
+
+            steps {
+
+                echo '======================================'
+                echo ' TESTING'
+                echo '======================================'
+
+                // Ejecuta pruebas unitarias.
+                // JaCoCo genera el reporte automáticamente
+                // porque está configurado en el pom.xml.
+                sh './mvnw test'
+            }
+
+            post {
+
+                always {
+
+                    // Publica los resultados de las pruebas
+                    // dentro de Jenkins.
+                    junit allowEmptyResults: true,
+                          testResults: 'target/surefire-reports/*.xml'
+                }
+            }
+        }
+
+
+        stage('SonarQube') {
+
+            steps {
+
+                echo '======================================'
+                echo ' SONARQUBE ANALYSIS'
+                echo '======================================'
+
+                // El token se obtiene desde Jenkins Credentials.
+                withCredentials([
+
+                    string(
+                        credentialsId: 'sonarqube-token',
+                        variable: 'SONAR_TOKEN'
+                    )
+
+                ]) {
+
+                    sh '''
+                        ./mvnw sonar:sonar \
+                        -Dsonar.projectKey=devsecops-java-microservice \
+                        -Dsonar.projectName=devsecops-java-microservice \
+                        -Dsonar.host.url=${SONAR_HOST_URL} \
+                        -Dsonar.token=${SONAR_TOKEN}
+                    '''
+                }
+            }
+        }
+
+
+        stage('Package FAT JAR') {
+
+            steps {
+
+                echo '======================================'
+                echo ' PACKAGE FAT JAR'
+                echo '======================================'
+
+                // Las pruebas ya fueron ejecutadas anteriormente.
+                sh './mvnw package -DskipTests'
+
+                // Muestra el contenido de target
+                // para verificar el artefacto.
+                sh 'ls -lah target/'
+            }
+        }
+
+
+        stage('Verify Artifact') {
+
+            steps {
+
+                echo '======================================'
+                echo ' VERIFY FAT JAR'
+                echo '======================================'
+
+                // Verifica que el FAT JAR exista antes
+                // de intentar construir la imagen Docker.
+                sh '''
+                    test -f target/devsecops-java-microservice-0.0.1-SNAPSHOT.jar
+                '''
+            }
+        }
+
+
+        stage('Docker Build') {
+
+            steps {
+
+                echo '======================================'
+                echo ' DOCKER BUILD'
+                echo '======================================'
+
+                // Se generan dos tags:
+                //
+                // BUILD_NUMBER permite mantener histórico.
+                // latest apunta a la versión más reciente.
+                sh '''
+                    docker build \
+                    -t ${DOCKER_IMAGE}:${BUILD_NUMBER} \
+                    -t ${DOCKER_IMAGE}:latest \
+                    .
+                '''
+            }
+        }
+
+
+        stage('Docker Push') {
+
+            steps {
+
+                echo '======================================'
+                echo ' DOCKER HUB PUSH'
+                echo '======================================'
+
+                // Usuario y token de Docker Hub
+                // se obtienen desde Jenkins Credentials.
+                withCredentials([
+
+                    usernamePassword(
+                        credentialsId: 'dockerhub-credentials',
+                        usernameVariable: 'DOCKER_USER',
+                        passwordVariable: 'DOCKER_TOKEN'
+                    )
+
+                ]) {
+
+                    sh '''
+
+                        echo "${DOCKER_TOKEN}" | \
+                        docker login \
+                        -u "${DOCKER_USER}" \
+                        --password-stdin
+
+
+                        docker push ${DOCKER_IMAGE}:${BUILD_NUMBER}
+
+                        docker push ${DOCKER_IMAGE}:latest
+
+
+                        docker logout
+                    '''
+                }
+            }
+        }
+
+    }
+
+
+    post {
+
+        success {
+
+            echo '======================================'
+            echo ' PIPELINE FINALIZADO CORRECTAMENTE'
+            echo '======================================'
+
+            echo "Imagen publicada: ${DOCKER_IMAGE}:${BUILD_NUMBER}"
+            echo "Imagen publicada: ${DOCKER_IMAGE}:latest"
+        }
+
+
+        failure {
+
+            echo '======================================'
+            echo ' PIPELINE FALLIDO'
+            echo '======================================'
+        }
+
+
+        always {
+
+            // Jenkins también almacena una copia
+            // del FAT JAR generado.
+            archiveArtifacts(
+                artifacts: 'target/*.jar',
+                fingerprint: true,
+                allowEmptyArchive: true
+            )
+        }
+    }
+}
